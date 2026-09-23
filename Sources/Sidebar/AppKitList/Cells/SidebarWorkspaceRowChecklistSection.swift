@@ -45,6 +45,11 @@ final class SidebarRowChecklistSection: NSView {
     /// zero-width frame pins the popover to the row's left edge (the legacy
     /// anchor-collapse bug class).
     private var pendingPopoverPresentation = false
+    /// macOS 26 closes a transient NSPopover when its positioning view leaves
+    /// the window, even if the row is synchronously reparented back into that
+    /// same window. Remember that detach so the close callback can distinguish
+    /// a presentation-preserving reparent from a real external dismissal.
+    private var popoverAnchorDetachedWhilePresented = false
     /// Container write-back captured at present time, so an external close —
     /// or this pooled cell being reused for another workspace — clears the
     /// PRESENTED workspace's state even after `self.actions` was replaced
@@ -182,6 +187,7 @@ final class SidebarRowChecklistSection: NSView {
             lastAddFieldToken = 0
             lastPopoverModel = nil
             pendingPopoverPresentation = false
+            popoverAnchorDetachedWhilePresented = false
             lastConfigureKey = nil
             // Recycled cells must not retain the previous workspace through
             // configured children: field closures and action bundles capture
@@ -329,6 +335,7 @@ final class SidebarRowChecklistSection: NSView {
         activePopoverDismissContext = nil
         awaitingPopoverDismissAck = false
         pendingPopoverPresentation = false
+        popoverAnchorDetachedWhilePresented = false
         lastAddFieldToken = 0
         lastPopoverModel = nil
         lastConfigureKey = nil
@@ -402,14 +409,44 @@ final class SidebarRowChecklistSection: NSView {
             presentedChange(false)
             consumeToken()
         }
+        let presentedWorkspaceId = model.workspaceId
         popoverPresenter.onExternalDismiss = { [weak self] in
+            guard let self else { return }
+
+            if self.popoverAnchorDetachedWhilePresented {
+                // Replacing/reparenting AppKit row roots can temporarily detach
+                // the anchor and make NSPopover close itself. Give the same-turn
+                // reattach a chance to land before treating that close as user
+                // intent. A row that stayed detached (or was reused) still
+                // performs the normal presentation write-back below.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.popoverAnchorDetachedWhilePresented = false
+                    if self.window != nil,
+                       self.model?.workspaceId == presentedWorkspaceId,
+                       self.model?.isChecklistPopoverPresented == true {
+                        self.awaitingPopoverDismissAck = false
+                        self.activePopoverDismissContext = nil
+                        self.pendingPopoverPresentation = true
+                        self.needsLayout = true
+                        self.layoutSubtreeIfNeeded()
+                        return
+                    }
+                    self.awaitingPopoverDismissAck = true
+                    presentedChange(false)
+                    consumeToken()
+                    self.activePopoverDismissContext = nil
+                }
+                return
+            }
+
             // AppKit closed us (click-away / deactivation): latch until the
             // container acknowledges, and consume any pending add request
             // like the legacy presented-binding write-back does.
-            self?.awaitingPopoverDismissAck = true
+            self.awaitingPopoverDismissAck = true
             presentedChange(false)
             consumeToken()
-            self?.activePopoverDismissContext = nil
+            self.activePopoverDismissContext = nil
         }
         // Legacy anchor: the section's top-trailing corner, opening to the
         // right (`preferredEdge: .maxX`, min width 320, max 520).
@@ -419,6 +456,13 @@ final class SidebarRowChecklistSection: NSView {
             of: self,
             preferredEdge: .maxX
         )
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil, popoverPresenter.isShown {
+            popoverAnchorDetachedWhilePresented = true
+        }
+        super.viewWillMove(toWindow: newWindow)
     }
 
     override func viewDidMoveToWindow() {

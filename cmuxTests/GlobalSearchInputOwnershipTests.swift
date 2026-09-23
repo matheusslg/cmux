@@ -251,7 +251,7 @@ extension GlobalSearchShortcutBehaviorTests {
 #endif
     }
 
-    @Test func browserEditingShortcutCompletesActiveGlobalSearchChord() throws {
+    @Test func browserEditingShortcutCompletesActiveGlobalSearchChord() async throws {
 #if DEBUG
         let appDelegate = try #require(AppDelegate.shared)
         let harness = try makeBrowserHarness(appDelegate: appDelegate)
@@ -260,6 +260,14 @@ extension GlobalSearchShortcutBehaviorTests {
             appDelegate.debugResetShortcutRoutingStateForTesting()
             closeWindow(harness.window, appDelegate: appDelegate)
         }
+
+        NSApp.activate(ignoringOtherApps: true)
+        #expect(
+            await AppKitTestEventPump().waitUntil(timeout: .seconds(10)) {
+                NSApp.isActive
+            },
+            "Browser shortcut fixture requires an active application for transient popover presentation"
+        )
 
         KeyboardShortcutSettings.setShortcut(
             StoredShortcut(
@@ -292,7 +300,12 @@ extension GlobalSearchShortcutBehaviorTests {
             appDelegate.debugHandleCustomShortcut(event: suffixEvent),
             "Cmd-C must complete an already-active Global Search chord"
         )
-        #expect(GlobalSearchCoordinator.shared.isPaletteVisible())
+        #expect(
+            await AppKitTestEventPump().waitUntil(timeout: .seconds(5)) {
+                GlobalSearchCoordinator.shared.isPaletteVisible()
+            },
+            "Completing the active Global Search chord should present the palette"
+        )
 #else
         Issue.record("Global Search input-ownership routing requires a DEBUG build")
 #endif
