@@ -523,6 +523,40 @@ rescue ArgumentError
   fail!("#{path} has malformed base64")
 end
 
+def pull_request_merge_base(repository, base_sha, head_sha)
+  # Pinned to both SHAs rather than read from the live pull request, so a push
+  # during validation cannot change which revision this verdict describes.
+  comparison = api_json(repository, "repos/#{repository}/compare/#{base_sha}...#{head_sha}?per_page=1")
+  merge_base = comparison.is_a?(Hash) ? comparison.dig("merge_base_commit", "sha") : nil
+  fail!("pull-request merge base is malformed") unless merge_base.is_a?(String) && merge_base.match?(SHA)
+  merge_base
+end
+
+# A file the pull request leaves as it was at the merge base reaches main as
+# main's copy, so that copy is the one to judge. Judging the head's copy of an
+# untouched file rejected every branch cut before the latest policy or guard
+# update on main, as if the branch were reverting it.
+def merged_file(base_content, head_content, merge_base_content)
+  head_content == merge_base_content ? base_content : head_content
+end
+
+def run_merge_base_regression_matrix!
+  cases = [
+    ["untouched stale file takes main's copy", "main", "old", "old", "main"],
+    ["untouched current file", "main", "main", "main", "main"],
+    ["changed file keeps the head copy", "main", "edit", "old", "edit"],
+    ["changed current file keeps the head copy", "main", "edit", "main", "edit"],
+    ["deleted file stays deleted", "main", nil, "old", nil],
+    ["file main added after the branch point", "main", nil, nil, "main"],
+    ["file the branch added", nil, "new", nil, "new"],
+  ]
+  failures = cases.filter_map do |name, base, head, merge_base, expected|
+    name unless merged_file(base, head, merge_base) == expected
+  end
+  fail!("merge-base regression matrix failed: #{failures.join('; ')}") unless failures.empty?
+  puts "PASS: merge-base regression matrix (#{cases.length} cases)"
+end
+
 def walk(value, &block)
   case value
   when Hash
@@ -2522,6 +2556,7 @@ begin
   run_lifecycle_regression_matrix!
   run_document_contract_regression_matrix!
   run_trusted_review_regression_matrix!
+  run_merge_base_regression_matrix!
   repository = required_env("GH_REPO", REPOSITORY)
   pr_number = required_env("PR_NUMBER", /\A[1-9][0-9]*\z/)
   base_sha = required_env("BASE_SHA", SHA)
@@ -2562,26 +2597,37 @@ begin
   head_repository = live_head_repo["full_name"].to_s
   fail!("pull request head repository name is malformed") unless head_repository.match?(REPOSITORY)
 
-  base_workflow = fetch_file(repository, base_sha, ".github/workflows/cla.yml")
-  # A fork pull request stores the head commit in the head repository. Fetch
-  # base files from the protected repository and candidate files from the
-  # validated head repository, so normal external contributions are admitted.
-  head_workflow = fetch_file(head_repository, head_sha, ".github/workflows/cla.yml")
+  # The merge base is an ancestor of main, so its files come from the
+  # protected repository like the base files do.
+  merge_base_sha = pull_request_merge_base(repository, base_sha, head_sha)
+  merged = lambda do |path, allow_missing: false|
+    base_content = fetch_file(repository, base_sha, path, allow_missing: allow_missing)
+    # A fork pull request stores the head commit in the head repository. Fetch
+    # base files from the protected repository and candidate files from the
+    # validated head repository, so normal external contributions are admitted.
+    head_content = fetch_file(head_repository, head_sha, path, allow_missing: true)
+    merge_base_content = fetch_file(repository, merge_base_sha, path, allow_missing: true)
+    [base_content, merged_file(base_content, head_content, merge_base_content)]
+  end
+
+  base_workflow, head_workflow = merged.call(".github/workflows/cla.yml")
   fail!("CLA workflow is missing from the pull-request revision") if head_workflow.nil?
-  base_guard_workflow = fetch_file(repository, base_sha, ".github/workflows/cla-policy-guard.yml", allow_missing: true)
-  head_guard_workflow = fetch_file(head_repository, head_sha, ".github/workflows/cla-policy-guard.yml", allow_missing: true)
-  base_guard_script = fetch_file(repository, base_sha, "scripts/ci/validate-cla-policy.rb", allow_missing: true)
-  head_guard_script = fetch_file(head_repository, head_sha, "scripts/ci/validate-cla-policy.rb", allow_missing: true)
+  base_guard_workflow, head_guard_workflow = merged.call(".github/workflows/cla-policy-guard.yml", allow_missing: true)
+  base_guard_script, head_guard_script = merged.call("scripts/ci/validate-cla-policy.rb", allow_missing: true)
   guard_changed = base_guard_workflow != head_guard_workflow || base_guard_script != head_guard_script
 
-  base_cla = fetch_file(repository, base_sha, CLA_DOCUMENT_PATH)
-  head_cla = fetch_file(head_repository, head_sha, CLA_DOCUMENT_PATH)
+  base_cla, head_cla = merged.call(CLA_DOCUMENT_PATH)
+  fail!("CLA document is missing from the pull-request revision") if head_cla.nil?
   base_action_ref = cla_action_reference(base_workflow, "base CLA workflow")
   head_action_ref = cla_action_reference(head_workflow, "proposed CLA workflow")
   base_script_path = cla_helper_path(base_action_ref)
   head_script_path = cla_helper_path(head_action_ref)
   base_script = base_script_path && fetch_file(repository, base_sha, base_script_path, allow_missing: true)
-  head_script = head_script_path && fetch_file(head_repository, head_sha, head_script_path, allow_missing: true)
+  head_script = if head_script_path && head_script_path == base_script_path
+    merged.call(head_script_path, allow_missing: true).last
+  else
+    head_script_path && fetch_file(head_repository, head_sha, head_script_path, allow_missing: true)
+  end
   policy_changed = base_workflow != head_workflow ||
     base_script_path != head_script_path ||
     base_script != head_script
