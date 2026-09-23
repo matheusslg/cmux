@@ -169,7 +169,8 @@ def validate_scope_python(scope_run: str) -> None:
 
 
 EXPECTED_CHECKS = [{'env': {'SCOPE_MODE': "${{ steps.selected_scope.outputs.mode || 'full' }}",
-          'SELECTED_COUNT': '${{ steps.selected_scope.outputs.selected_count }}'},
+          'SELECTED_COUNT': '${{ steps.selected_scope.outputs.selected_count }}',
+          'MERGE_BASE': '${{ steps.merge_base.outputs.sha }}'},
   'if': "github.event_name != 'push' && steps.scope.outputs.run == 'true'",
   'name': 'Check pull-request or merge-group source with trusted policy',
   'run': 'set -euo pipefail\n'
@@ -181,6 +182,9 @@ EXPECTED_CHECKS = [{'env': {'SCOPE_MODE': "${{ steps.selected_scope.outputs.mode
          '  --base-baseline "$GITHUB_WORKSPACE/trusted/web/oxlint-complexity-baseline.txt"\n'
          '  --head "$CANDIDATE_SHA"\n'
          ')\n'
+         'if [[ -n "$MERGE_BASE" ]]; then\n'
+         '  checker+=(--merge-base "$MERGE_BASE")\n'
+         'fi\n'
          'case "$SCOPE_MODE" in\n'
          '  full|skip)\n'
          '    echo "Web complexity: selected $SELECTED_COUNT production file(s) for conservative '
@@ -594,6 +598,72 @@ def test_checker_protects_trusted_scoper() -> None:
         temp.cleanup()
 
 
+def test_checker_judges_trusted_files_by_what_the_branch_changed() -> None:
+    if shutil.which("node") is None:
+        raise AssertionError("node is required for the checker merge-base regression")
+
+    temp = tempfile.TemporaryDirectory()
+    try:
+        root = Path(temp.name)
+        trusted = root / "trusted"
+        candidate = root / "candidate"
+        (trusted / "web/scripts").mkdir(parents=True)
+        shutil.copy2(CHECKER, trusted / "web/scripts/check-complexity.mjs")
+        (trusted / "web/node_modules/typescript").mkdir(parents=True)
+        write(
+            trusted,
+            "web/node_modules/typescript/package.json",
+            '{"type":"module","exports":"./index.js"}\n',
+        )
+        write(trusted, "web/node_modules/typescript/index.js", "export {};\n")
+        # Main updated the trusted files after the branch point.
+        write(trusted, ".github/workflows/web-complexity-trusted.yml", "main\n")
+        write(trusted, "scripts/ci/scope-web-complexity.py", "main\n")
+
+        candidate.mkdir()
+        git(candidate, "init", "-q")
+        git(candidate, "config", "user.email", "ci@example.com")
+        git(candidate, "config", "user.name", "CI")
+        (candidate / "web/scripts").mkdir(parents=True)
+        shutil.copy2(CHECKER, candidate / "web/scripts/check-complexity.mjs")
+        write(candidate, ".github/workflows/web-complexity-trusted.yml", "old\n")
+        write(candidate, "scripts/ci/scope-web-complexity.py", "old\n")
+        merge_base = commit(candidate, "branch point")
+
+        def check(*extra: str) -> subprocess.CompletedProcess[bytes]:
+            return run(
+                [
+                    "node",
+                    str(trusted / "web/scripts/check-complexity.mjs"),
+                    "--repo-root",
+                    str(candidate),
+                    "--tool-root",
+                    str(trusted),
+                    *extra,
+                ],
+                check=False,
+            )
+
+        # Without a merge base, a stale branch is still compared strictly.
+        result = check()
+        assert result.returncode == 2
+        assert b"is a trusted policy file" in result.stderr
+
+        # The branch left both files alone, so the merge keeps main's copies.
+        result = check("--merge-base", merge_base)
+        assert b"trusted policy file" not in result.stderr, result.stderr
+        assert b"must remain present" not in result.stderr, result.stderr
+
+        # A branch that edits a trusted file is still rejected.
+        write(candidate, "scripts/ci/scope-web-complexity.py", "edit\n")
+        commit(candidate, "edit the scoper")
+        result = check("--merge-base", merge_base)
+        assert result.returncode == 2
+        assert b"scripts/ci/scope-web-complexity.py is a trusted policy file" in result.stderr
+    finally:
+        temp.cleanup()
+
+
 def test_checker_baseline_ratchet() -> None:
     if shutil.which("node") is None:
         raise AssertionError("node is required for the checker ratchet regression")
@@ -717,6 +787,7 @@ def main() -> int:
     test_policy_symlink_fails_closed()
     test_selected_symlink_fails_closed()
     test_checker_protects_trusted_scoper()
+    test_checker_judges_trusted_files_by_what_the_branch_changed()
     test_checker_baseline_ratchet()
     print("PASS: trusted web complexity scopes work before Bun and runs checks from the trusted checkout")
     return 0
