@@ -218,12 +218,36 @@ jobs:
           set -euo pipefail
           : > "$GITHUB_WORKSPACE/trusted/.bunfig-empty.toml"
 
+      # A trusted file the pull request leaves as it was at the merge base
+      # reaches main as main's copy, so the checker skips it rather than
+      # rejecting a branch cut before main's latest policy update. Without a
+      # merge base the checker keeps comparing every trusted file byte for byte.
+      - name: Resolve pull-request merge base
+        id: merge_base
+        if: github.event_name == 'pull_request_target' && steps.scope.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          merge_base="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${TRUSTED_SHA}...${CANDIDATE_SHA}?per_page=1" --jq '.merge_base_commit.sha' || true)"
+          if [[ ! "$merge_base" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Merge base unavailable; comparing trusted files strictly."
+            exit 0
+          fi
+          if ! git -C candidate -c protocol.version=2 fetch --no-tags --depth=1 \
+            "https://github.com/${GITHUB_REPOSITORY}.git" "$merge_base"; then
+            echo "Merge base fetch failed; comparing trusted files strictly."
+            exit 0
+          fi
+          echo "sha=$merge_base" >> "$GITHUB_OUTPUT"
+
       - name: Check pull-request or merge-group source with trusted policy
         if: github.event_name != 'push' && steps.scope.outputs.run == 'true'
         working-directory: trusted/web
         env:
           SCOPE_MODE: ${{ steps.selected_scope.outputs.mode || 'full' }}
           SELECTED_COUNT: ${{ steps.selected_scope.outputs.selected_count }}
+          MERGE_BASE: ${{ steps.merge_base.outputs.sha }}
         run: |
           set -euo pipefail
           checker=(
@@ -234,6 +258,9 @@ jobs:
             --base-baseline "$GITHUB_WORKSPACE/trusted/web/oxlint-complexity-baseline.txt"
             --head "$CANDIDATE_SHA"
           )
+          if [[ -n "$MERGE_BASE" ]]; then
+            checker+=(--merge-base "$MERGE_BASE")
+          fi
           case "$SCOPE_MODE" in
             full|skip)
               echo "Web complexity: selected $SELECTED_COUNT production file(s) for conservative full scan."

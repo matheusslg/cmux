@@ -52,6 +52,7 @@ function git(args, cwd = process.cwd(), allowFailure = false) {
 function parseArgs() {
   let base;
   let head;
+  let mergeBase;
   let repoRoot;
   let toolRoot;
   let baseBaseline;
@@ -62,15 +63,19 @@ function parseArgs() {
     const arg = args[index];
     if (arg === "--help" || arg === "-h") {
       console.log(
-        "Usage: bun scripts/check-complexity.mjs [--base <sha> --head <sha>] [--repo-root <path>] [--tool-root <path>] [--base-baseline <path>] [--files <path> ...]",
+        "Usage: bun scripts/check-complexity.mjs [--base <sha> --head <sha>] [--merge-base <sha>] [--repo-root <path>] [--tool-root <path>] [--base-baseline <path>] [--files <path> ...]",
       );
       process.exit(0);
     }
-    if (arg === "--base" || arg === "--head") {
+    if (arg === "--base" || arg === "--head" || arg === "--merge-base") {
       const value = args[index + 1];
       if (!value || value.startsWith("--")) fail(`${arg} requires a commit SHA`);
       if (arg === "--base") base = value;
-      else head = value;
+      else if (arg === "--head") head = value;
+      else {
+        if (!/^[0-9a-f]{40}$/.test(value)) fail("--merge-base requires a full commit SHA");
+        mergeBase = value;
+      }
       index += 1;
       continue;
     }
@@ -93,7 +98,7 @@ function parseArgs() {
 
   if ((base && !head) || (!base && head && !baseBaseline)) fail("--base or --base-baseline must be provided with --head");
   if (base && baseBaseline) fail("use only one of --base and --base-baseline");
-  return { base, head, repoRoot, toolRoot, baseBaseline, files };
+  return { base, head, mergeBase, repoRoot, toolRoot, baseBaseline, files };
 }
 
 function isProductionSource(repoPath) {
@@ -372,10 +377,22 @@ function oxlintLockEntries(root) {
     .join("\n");
 }
 
-function assertTrustedPolicy(repoRoot, toolRoot) {
+// A trusted file the pull request leaves as it was at the merge base reaches
+// main as main's copy. Comparing a stale branch's copy against main's tip
+// rejected every branch cut before the latest policy update on main.
+function unchangedSinceMergeBase(repoRoot, mergeBase, relative) {
+  if (!mergeBase) return false;
+  const candidateFile = path.join(repoRoot, relative);
+  const atMergeBase = git(["cat-file", "blob", `${mergeBase}:${relative}`], repoRoot, true);
+  if (!existsSync(candidateFile)) return atMergeBase.status !== 0;
+  return atMergeBase.status === 0 && atMergeBase.stdout === readFileSync(candidateFile, "utf8");
+}
+
+function assertTrustedPolicy(repoRoot, toolRoot, mergeBase) {
   if (path.resolve(repoRoot) === path.resolve(toolRoot)) return;
 
   for (const relative of TRUSTED_POLICY_FILES) {
+    if (unchangedSinceMergeBase(repoRoot, mergeBase, relative)) continue;
     const trustedFile = path.join(toolRoot, relative);
     const candidateFile = path.join(repoRoot, relative);
     if (!existsSync(trustedFile) || !existsSync(candidateFile)) {
@@ -527,11 +544,11 @@ function diagnosticKey(repoRoot, diagnostic) {
   return `${filename}\t${diagnosticFingerprint(repoRoot, diagnostic)}\t${String(diagnostic.message ?? "")}`;
 }
 
-const { base, head, repoRoot: requestedRepoRoot, toolRoot: requestedToolRoot, baseBaseline, files: explicitFiles } = parseArgs();
+const { base, head, mergeBase, repoRoot: requestedRepoRoot, toolRoot: requestedToolRoot, baseBaseline, files: explicitFiles } = parseArgs();
 const repoRoot = requestedRepoRoot ? path.resolve(requestedRepoRoot) : git(["rev-parse", "--show-toplevel"]).stdout.trim();
 const toolRoot = requestedToolRoot ? path.resolve(requestedToolRoot) : repoRoot;
 assertCheckedOutHead(repoRoot, head);
-assertTrustedPolicy(repoRoot, toolRoot);
+assertTrustedPolicy(repoRoot, toolRoot, mergeBase);
 const baseline = readBaseline(repoRoot);
 assertBaselineOnlyShrinks(repoRoot, base, baseline, baseBaseline ? path.resolve(baseBaseline) : undefined);
 const files = sourceFiles(repoRoot, explicitFiles);
