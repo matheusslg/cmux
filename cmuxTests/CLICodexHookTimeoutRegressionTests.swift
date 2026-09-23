@@ -951,8 +951,10 @@ struct CLICodexHookTimeoutRegressionTests {
             try? FileManager.default.removeItem(at: root)
         }
 
-        #expect(kill(pid_t(deadPID), 0) == -1)
-        #expect(errno == ESRCH)
+        let killResult = kill(pid_t(deadPID), 0)
+        let killErrno = errno
+        #expect(killResult == -1)
+        #expect(killErrno == ESRCH)
 
         let now = Date().timeIntervalSince1970
         let store: [String: Any] = [
