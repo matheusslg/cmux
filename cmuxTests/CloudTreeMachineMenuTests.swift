@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import CmuxCloudMachines
 import Testing
 import Observation
@@ -460,6 +461,65 @@ struct CloudTreeMachineMenuTests {
         #expect(recorder.pinChanges.count == 1)
         #expect(recorder.pinChanges.first?.0 == Self.machineID)
         #expect(recorder.pinChanges.first?.1 == true)
+    }
+
+    /// The machine row's hover trash is SwiftUI inside an NSTableView row.
+    /// NSTableView forwards a click only to subviews it validates, so a click
+    /// on the trash used to run the row's click action (toggle) and never
+    /// reached `confirmDelete`.
+    @Test("A click on the machine row's hover trash reaches confirmDelete, not the row toggle")
+    func hoverTrashClickReachesDelete() async throws {
+        let recorder = CloudTreeMenuVerbRecorder()
+        let coordinator = CloudTreeOutlineView.Coordinator(
+            machineActions: Self.machineActions(recording: recorder),
+            nodeActions: Self.nodeActions(recording: recorder),
+            expansionStore: CloudTreeExpansionStore(
+                defaults: UserDefaults(suiteName: "cloud-tree-hover-trash-\(UUID().uuidString)")!
+            ),
+            tabDragTransferRegistry: { nil }
+        )
+        let container = CloudTreeContainerView(coordinator: coordinator)
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 400), styleMask: [.titled], backing: .buffered, defer: false)
+        window.contentView = container
+        defer { window.contentView = nil; withExtendedLifetime(window) {} }
+        coordinator.apply(nodes: [Self.machineNode()])
+        container.layoutSubtreeIfNeeded()
+
+        let outline = try #require(coordinator.outlineView)
+        let cell = try #require(outline.view(atColumn: 0, row: 0, makeIfNecessary: true) as? CloudTreeCellView)
+        cell.setHovered(true)
+        cell.layoutSubtreeIfNeeded()
+        let buttons = try #require(cell.subviews.first {
+            $0 is NSHostingView<AnyView> && !($0 is CloudTreePassthroughHostingView)
+        })
+        let center = buttons.convert(NSPoint(x: buttons.bounds.midX, y: buttons.bounds.midY), to: nil)
+
+        // AppKit's own routing question: may the table hand this click to the view under it?
+        let hit = try #require(outline.hitTest(outline.superview!.convert(center, from: nil)))
+        #expect(hit.isDescendant(of: buttons))
+        #expect(outline.validateProposedFirstResponder(hit, for: nil))
+
+        // The whole click, dispatched the way AppKit delivers it.
+        func mouse(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.mouseEvent(
+                with: type, location: center, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1
+            )
+        }
+        let down = try #require(mouse(.leftMouseDown))
+        let up = try #require(mouse(.leftMouseUp))
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        // Queue the mouse-up first: if the table keeps the click, its tracking
+        // loop consumes it. If a subview takes the click, AppKit delivers the
+        // mouse-up through the window, so this test does the same.
+        NSApp.postEvent(up, atStart: false)
+        window.sendEvent(down)
+        if let queuedUp = NSApp.nextEvent(matching: .leftMouseUp, until: Date(), inMode: .default, dequeue: true) {
+            window.sendEvent(queuedUp)
+        }
+        _ = await AppKitTestEventPump().waitUntil { !recorder.deletions.isEmpty }
+        #expect(recorder.deletions == [Self.machineID])
     }
 
     private static func machineNode(expired: Bool = false) -> CloudTreeNode {
